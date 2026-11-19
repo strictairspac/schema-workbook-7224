@@ -9,7 +9,9 @@ services:
       MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-schemaworkbook_demo_pw}
       MYSQL_DATABASE: schemaworkbook
     ports: ["${DB_PORT:-17743}:3306"]
-    volumes: [db-data:/var/lib/mysql]
+    volumes:
+      - db-data:/var/lib/mysql
+      - ./backend/migrations/003_trial_admin.sql:/docker-entrypoint-initdb.d/003_trial_admin.sql:ro
     healthcheck:
       test: [CMD-SHELL, 'mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent']
       interval: 3s
@@ -30,6 +32,10 @@ services:
     container_name: ${COMPOSE_PROJECT_NAME:-schema-workbook}-backend
     environment: &env
       DATABASE_URL: mysql+pymysql://schemaworkbook:${DB_PASSWORD:-schemaworkbook_demo_pw}@db:3306/schemaworkbook
+      # Least-privilege DSN used only by the worker to manage isolated trial
+      # schemas (trial_* databases); trial_admin has no rights on the business
+      # database or mysql catalog. Created by migrations/003_trial_admin.sql.
+      TRIAL_ADMIN_URL: mysql+pymysql://trial_admin:${DB_PASSWORD:-schemaworkbook_demo_pw}@db:3306/
       REDIS_URL: redis://redis:6379/0
       JWT_SECRET: ${JWT_SECRET:-local-schema-workbook-change-before-public-use}
       SEED_DEMO: ${SEED_DEMO:-true}

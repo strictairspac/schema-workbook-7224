@@ -6,7 +6,7 @@
 
 原先设计员在Excel里堆叠委托号、客户、检测项、方法与结果，再手工画表结构。痛点：依赖口径难确认、复合键容易漏判、拆表后无法证明无损。上游为委托单和已确认业务规则，本项目承接关系草案登记、函数依赖编辑、3NF合成、验证报告导出，下游为实验数据录入系统的数据库设计人员。
 
-核心实体：关系草案 Relation、函数依赖 Dependency、分解报告 Report。4业务页和独立登录页；管理员另有审计页。业务规则不执行为SQL，属性名是纯数据。
+核心实体：关系草案 Relation、函数依赖 Dependency、分解报告 Report、索引试验 IndexTrial/IndexTrialCombo。5业务页（关系草案、依赖编辑、分解任务、校验详情含索引试验录入、索引试验）和独立登录页；管理员另有审计页。业务规则不执行为SQL，属性名是纯数据；索引试验仅在隔离库内对冻结样本执行DDL/DML。
 
 ## 快速启动
 
@@ -44,17 +44,29 @@ Python真算，MySQL保存草案/依赖与结果，Redis传递任务，独立wor
 
 这是小型关系模型设计辅助工具，FD由人工提供，不能从脏数据自动推断业务规则；不连接生产数据或自动执行DDL。精确投影在10属性内有界，仍可能随依赖复杂度增加耗时。单worker串行队列，不带生产任务重试/崩溃续跑。
 
+## 索引选型试验（报告页）
+
+拆解报告定了分表之后，在**报告详情页（校验详情）**直接录入索引试验，数据冻结后实测，不碰任何生产库：
+
+- **委托样本**：CSV 粘贴（首行表头即属性列，最多 20 万行）；**常用查询**：1–20 条只读 SELECT（禁 DDL/DML/分号，后端校验）；**候选索引**：1–12 个，列必须来自样本表头。
+- 空组合作为**无候选索引基线**，其余 `2^n-1` 个非空子集（上限 256 个）各自在**独立隔离的 MySQL schema** 中用**同一批数据**真实建表、建索引、回放查询。
+- 每个组合：`EXPLAIN` + `EXPLAIN FORMAT=JSON` 取执行计划与查询总估算成本；回放结果做 SHA256 校验，**与基线结果不一致即拒绝**；`information_schema` 实测占用（DATA_LENGTH+INDEX_LENGTH），**超过容量上限即拒绝**。
+- 只推荐**比基线省**（总估算成本严格更低）且容量内、结果一致的组合，按总估算成本最低择优；全部不合格时结论为「无可用组合」，页面可回看每个组合的执行计划 JSON 与实测占用。
+- **隔离**：schema 名 `trial_{试验id}_{时间戳}_{随机}`，按试验 id 前缀区分，组合间库互不影响，试验结束即清理，中断残留库在下次同试验运行开头自动回收。worker 用独立的最小权限账号 `trial_admin`（仅对 `trial%` 库有权限，见 `migrations/003_trial_admin.sql`）做隔离库的全部 DDL/回放，跨库读取业务库或 `mysql` 系统表直接 1142 拒绝；Web 应用账号 `schemaworkbook` 不持有任何 `trial%` 权限。
+- **可恢复**：组合按 `pending/running/measured/skipped/failed` 落库，已 `measured` 的（含基线）重试时直接复用、**不重复计入**；每次恢复换新 `run_token`，旧 worker 的迟到写入自动失效。中断后在试验详情页「恢复原试验」，仍回到同一条试验记录。
+- 前端路径 `#/trials`（列表）与 `#/trials/{id}`（详情）；写接口仅 operator/admin，viewer 只读 403。所有入队、推荐、无可用组合、恢复动作写审计日志。
+
 ## 工程结构
 
 |服务|技术|职责|
 |---|---|---|
-|frontend|原生HTML/CSS/JS + Nginx|4业务页、登录、共享业务表格与报告组件|
+|frontend|原生HTML/CSS/JS + Nginx|5业务页、登录、共享业务表格/报告/试验组件|
 |backend|Python3.11/FastAPI/SQLAlchemy/PyJWT|校验、权限、审计、快照与导出|
-|worker|Python3.11|闭包、候选键、3NF与chase|
-|db|MySQL8.0|JSON属性与依赖、任务报告|
-|redis|Redis7|持久任务队列|
+|worker|Python3.11|闭包、候选键、3NF与chase；索引试验隔离库实测与恢复|
+|db|MySQL8.0|JSON属性与依赖、任务报告、索引试验与逐组合实测结果|
+|redis|Redis7|持久任务队列（分解队列 + 索引试验队列）|
 
-目录：`frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}`；`backend/src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}`；`backend/scripts/seed_demo.py`；`backend/migrations/001_initial.sql`。每核心实体贯穿模型/schema/service/route/API/store/page。组件table/badge/frame复用，hooks/session/feedback和utils/forms/html共用；request_id/errors双后端中间件。
+目录：`frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}`；`backend/src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}`；`backend/scripts/seed_demo.py`；`backend/migrations/001_initial.sql`、`002_index_trials.sql`。每核心实体贯穿模型/schema/service/route/API/store/page。组件table/badge/frame复用，hooks/session/feedback和utils/forms/html共用；request_id/errors双后端中间件。索引试验实体 IndexTrial/IndexTrialCombo 对应 `src/services/index_trials.py`、`src/routes/index_trials.py`、`src/schemas/index_trial.py` 与 `frontend/src/pages/trials.js`。
 
 枚举：角色admin/operator/viewer、任务queued/running/completed/failed；前后端定义位于 `backend/src/constants/enums.py` 和 `frontend/src/constants/enums.js`，security/reports、frame/badge消费；worker持久化状态。
 
@@ -66,4 +78,4 @@ UI为酒红档案册，双字体由Google Fonts加载，离线有回退且业务
 
 ## License
 
-MIT。真实测试脚本、截图与结果保存在源码外 `../../test-artifacts/gb-4104/`。
+MIT。真实测试脚本与结果在仓库内 `tests/`：`e2e_index_trials.py`（同数据回放一致性、超容量拒绝、成本择优、校验422）、`e2e_trial_resume.py`（中断恢复、重试不重复计入已测组合）、`e2e_trial_concurrency.py`（并发试验隔离）、`smoke_frontend.mjs`（页面分支渲染）；源码外截图产物保存在 `../../test-artifacts/gb-4104/`。
